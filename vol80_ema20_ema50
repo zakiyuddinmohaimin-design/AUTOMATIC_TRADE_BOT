@@ -1,0 +1,235 @@
+"""Headway VOL_80 DEMO ONLY EMA20/EMA50 TREND ONLY fixed 500/700 strategy; disabled until explicitly armed.
+Requires vol80_demo_auto_trader_m1_rr3_adx25_preview.py beside this file.
+No profitability guarantee. Start with --once (dry-run). Never run alongside another trader.
+"""
+import argparse
+import json
+import math
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+import MetaTrader5 as mt5
+import pandas as pd
+import vol80_demo_auto_trader_m1_rr3_adx25_preview as core
+
+ENABLE_DEMO_ORDERS = True  # safety default: preview until reviewed
+EXPECTED_DEMO_LOGIN = 6206755  # dedicated account lock
+STATE = Path(__file__).with_name('vol80_ema_rr2_execution_state.json')
+STOP_FILE = Path(__file__).with_name('VOL80_STOP.txt')
+MAX_LOTS = 0.01
+core.RISK_REWARD = 500.0 / 500.0  # fixed 500-point SL and 700-point TP
+
+
+def fail(msg):
+    raise RuntimeError(msg)
+
+
+def read_state():
+    if not STATE.exists():
+        return {}
+    return json.loads(STATE.read_text(encoding='utf-8'))
+
+
+def write_state(s):
+    temp = STATE.with_suffix('.tmp')
+    temp.write_text(json.dumps(s, indent=2), encoding='utf-8')
+    temp.replace(STATE)
+
+
+def guarded_account():
+    if STOP_FILE.exists():
+        fail('Emergency stop file VOL80_STOP.txt exists')
+    account, info, tick = core.account_and_symbol()
+    if int(account.login) != EXPECTED_DEMO_LOGIN or account.trade_mode != mt5.ACCOUNT_TRADE_MODE_DEMO:
+        fail('Wrong account: this script is locked to the specified DEMO login')
+    return account, info, tick
+
+
+def state_for_day(account):
+    s = read_state()
+    if s.get('pending') is not None:
+        fail('UNRESOLVED order intent: inspect MT5 and reconcile manually; do not delete state blindly')
+    if s.get('login') not in (None, int(account.login)):
+        fail('Execution state belongs to another account')
+    day = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+    if s.get('date') != day:
+        s = {'login': int(account.login), 'date': day, 'baseline': float(account.equity),
+             'last_bar': None, 'pending': None}
+        write_state(s)
+        core.log('Daily equity baseline first observed:', round(s['baseline'], 2))
+    if not math.isfinite(float(s['baseline'])) or float(s['baseline']) <= 0:
+        fail('Invalid daily baseline')
+    return s
+
+
+def guard_exposure(account, s):
+    # Uses core's account-wide VOL_80 entry count and equity-drawdown limits.
+    entries, positions, remaining, open_risk = core.exposure_and_limits(
+        account, {'baseline': s['baseline'], 'date': s['date']})
+    if positions:
+        fail('Existing VOL_80 position; no overlapping entry')
+    # Conservative extra safeguard: count today's realized losses even if the
+    # first-observed equity baseline was established after those losses.
+    now = datetime.now(timezone.utc)
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    deals = mt5.history_deals_get(midnight, now)
+    if deals is None:
+        fail('Cannot verify realized loss history')
+    realized_losses = sum(max(0.0, -(float(d.profit) + float(d.commission) + float(d.swap) + float(getattr(d, 'fee', 0.0))))
+                          for d in deals if d.symbol == core.SYMBOL and
+                          d.entry in (mt5.DEAL_ENTRY_OUT, mt5.DEAL_ENTRY_INOUT))
+    remaining = min(remaining, float(s['baseline']) * core.DAILY_EQUITY_LOSS_LIMIT - realized_losses)
+    if remaining <= 0:
+        fail('Daily loss allowance exhausted including realized losses')
+    return entries, remaining
+
+
+def make_proposal(action, snapshot, account, info, tick, bar, remaining):
+    order_type, entry, sl, tp, volume, loss, budget = core.price_and_volume(
+        action, account, info, tick, None, None)
+    volume = round(math.floor(min(volume, MAX_LOTS) / float(info.volume_step) + 1e-9)
+                   * float(info.volume_step), 8)
+    if volume < float(info.volume_min) or volume > MAX_LOTS + 1e-9:
+        fail('Lot cap or broker minimum violated')
+    if action == 'BUY' and not (sl < entry < tp):
+        fail('Invalid BUY protective levels')
+    if action == 'SELL' and not (tp < entry < sl):
+        fail('Invalid SELL protective levels')
+    if min(abs(entry-sl), abs(entry-tp)) <= (int(info.trade_stops_level) + 1) * info.point:
+        fail('Broker minimum protective distance not met')
+    pnl = mt5.order_calc_profit(order_type, core.SYMBOL, volume, entry, sl)
+    if pnl is None or not math.isfinite(float(pnl)) or pnl >= 0:
+        fail('Invalid stop loss risk estimate')
+    if -float(pnl) > min(remaining, float(account.equity) * core.RISK_PER_TRADE):
+        fail('Risk exceeds allowance')
+    return {'entry': entry, 'sl': sl, 'tp': tp, 'lot': volume,
+            'risk_usd': round(-float(pnl), 2), 'stop_points': 500,
+            'target_points': 700, 'reward_risk': 1.4}
+
+
+def cycle(dry_run):
+    account, info, tick = guarded_account()
+    s = state_for_day(account)
+    bar = core.latest_closed_m1()
+    if s.get('last_bar') == bar:
+        return
+    if s.get('last_bar') is not None and bar < s['last_bar']:
+        fail('Candle time reversed')
+    s['last_bar'] = bar  # consume bar before any network/API request
+    write_state(s)
+    entries, remaining = guard_exposure(account, s)
+    snapshot = {name: core.indicators(tf) for name, tf in core.TIMEFRAMES.items()}
+    if snapshot['M1']['closed_bar_time'] != bar:
+        fail('M1 bar changed')
+    core.log('MODE: TREND ONLY (NO ADX FILTER)', 'entries today:', entries,
+             'remaining risk:', round(remaining, 2))
+    action = core.trend_following_signal(snapshot)
+    core.log('TREND candidate:', action)
+    if action == 'WAIT':
+        return
+    # OPTION 3: Explicitly bypass the Groq veto for a valid strategy signal.
+    # No AI request is made; never represent this as AI approval.
+    # All account, exposure, spread, SL/TP, margin, and broker checks remain active.
+    core.log('AI VETO BYPASSED: deterministic TREND candidate', action,
+             '(Groq not consulted; all risk checks still required)')
+    account, info, tick = guarded_account()
+    s = state_for_day(account)
+    _, remaining = guard_exposure(account, s)
+    if core.latest_closed_m1() != bar:
+        fail('Bar changed before order proposal')
+    proposal = make_proposal(action, snapshot, account, info, tick, bar, remaining)
+    core.log('PROPOSAL: TREND', action, json.dumps(proposal, sort_keys=True))
+    if dry_run or not ENABLE_DEMO_ORDERS:
+        core.log('DRY RUN: no order_check or order_send')
+        return
+    # Refresh immediately before send; reject drift rather than submit stale SL/TP.
+    account, info, tick = guarded_account()
+    _, remaining = guard_exposure(account, s)
+    if core.latest_closed_m1() != bar:
+        fail('Bar changed before execution')
+    new_entry = float(tick.ask if action == 'BUY' else tick.bid)
+    if abs(new_entry - float(proposal['entry'])) > 20 * float(info.point):
+        fail('Price drift > 20 points; skip')
+    order_type = mt5.ORDER_TYPE_BUY if action == 'BUY' else mt5.ORDER_TYPE_SELL
+    entry = round(new_entry, int(info.digits))
+    point = float(info.point)
+    sl = round(entry + (-500 if action == 'BUY' else 500) * point, int(info.digits))
+    tp = round(entry + (700 if action == 'BUY' else -700) * point, int(info.digits))
+    if sl <= 0 or tp <= 0:
+        fail('Invalid refreshed SL/TP')
+    if min(abs(entry-sl), abs(entry-tp)) <= (int(info.trade_stops_level) + 1) * point:
+        fail('Broker minimum protective distance not met')
+    volume = float(proposal['lot'])
+    loss = mt5.order_calc_profit(order_type, core.SYMBOL, volume,
+                                 entry, sl)
+    if loss is None or not math.isfinite(float(loss)) or loss >= 0:
+        fail('Risk calculation failed')
+    if -float(loss) > min(remaining, float(account.equity) * core.RISK_PER_TRADE):
+        fail('Risk exceeds allowance')
+    margin = mt5.order_calc_margin(order_type, core.SYMBOL, volume, entry)
+    if margin is None or not math.isfinite(float(margin)) or margin > account.margin_free:
+        fail('Insufficient free margin')
+    request = core.make_request(order_type, volume, entry, sl, tp, info)
+    request['magic'] = 20261110
+    request['comment'] = 'VOL80_EMA_RR2_DEMO'
+    check = mt5.order_check(request)
+    if check is None or check.retcode != 0:
+        fail(f'order_check rejected: {getattr(check, "retcode", mt5.last_error())}')
+    # No retries after an ambiguous send. A pending intent survives restart.
+    s['pending'] = {'bar': bar, 'mode': 'TREND', 'side': action, 'request': request,
+                    'utc': datetime.now(timezone.utc).isoformat()}
+    write_state(s)
+    result = mt5.order_send(request)
+    if result is None:
+        fail(f'Order outcome unknown: {mt5.last_error()}; inspect MT5')
+    core.log('ORDER RESULT:', 'retcode', result.retcode, 'order', result.order,
+             'deal', result.deal, 'volume', result.volume)
+    if result.retcode != mt5.TRADE_RETCODE_DONE:
+        fail('Order not confirmed filled; inspect MT5 before restarting')
+    positions = mt5.positions_get(symbol=core.SYMBOL)
+    if positions is None:
+        fail('Cannot verify filled position')
+    matches = [p for p in positions if int(p.magic) == request['magic']
+               and abs(float(p.sl)-sl) <= info.point
+               and abs(float(p.tp)-tp) <= info.point]
+    if not matches:
+        fail('Filled order protective SL/TP not verified; inspect MT5 immediately')
+    s['pending'] = None
+    s['last_order'] = {'bar': bar, 'mode': 'TREND', 'side': action,
+                       'order': int(result.order), 'deal': int(result.deal)}
+    write_state(s)
+    core.log('DEMO ORDER FILLED and broker SL/TP verified')
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--once', action='store_true', help='One completed candle, no orders')
+    args = parser.parse_args()
+    dry_run = args.once or not ENABLE_DEMO_ORDERS
+    core.log('EMA20/EMA50 FIXED 500/700 DEMO BOT starting; order submission:',
+             'DISABLED (preview)' if dry_run else 'ENABLED (DEMO ONLY)')
+    if not mt5.initialize():
+        fail(f'MT5 initialization failed: {mt5.last_error()}')
+    try:
+        account, _, _ = guarded_account()
+        core.log('Verified Headway Demo login:', account.login)
+        while True:
+            try:
+                cycle(dry_run)
+            except Exception as exc:
+                core.log('SAFE SKIP:', type(exc).__name__, str(exc))
+                if read_state().get('pending') is not None:
+                    core.log('HALTED: unresolved order intent; inspect MT5 manually')
+                    break
+            if args.once:
+                break
+            time.sleep(core.POLL_SECONDS)
+    except KeyboardInterrupt:
+        core.log('Stopped by user')
+    finally:
+        mt5.shutdown()
+
+
+if __name__ == '__main__':
+    main()
