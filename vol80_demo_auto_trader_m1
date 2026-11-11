@@ -1,0 +1,476 @@
+"""Headway VOL_80 DEMO-only automated bot (Python 3.13).
+
+NO orders by default. Review and test, then explicitly set ENABLE_DEMO_ORDERS=True.
+Never use on a live account. No orders are submitted during script creation.
+"""
+import json
+import math
+import os
+import time
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+import MetaTrader5 as mt5
+import pandas as pd
+from groq import Groq
+
+SYMBOL = "VOL_80"
+MODEL = "openai/gpt-oss-20b"
+MIN_CONFIDENCE = 60
+RISK_PER_TRADE = 0.10   # upper bound; 0.01 lot cap is enforced separately
+MAX_LOTS = 0.01         # initial demo execution test limit
+DAILY_EQUITY_LOSS_LIMIT = 1.00
+MAX_DAILY_ENTRIES = 100
+MAX_OPEN_POSITIONS = 3
+RISK_REWARD = 700.0 / 500.0  # fixed-point ratio 1:1.4
+STOP_LOSS_POINTS = 500
+TAKE_PROFIT_POINTS = 700
+MAX_SPREAD_POINTS = 180  # provisional VOL_80 demo threshold; verify against spread and SL
+MAX_TICK_AGE_SECONDS = 120
+# Headway VOL_80 previously showed +7200s tick offset. Verify on every startup.
+BROKER_TIMESTAMP_OFFSET_SECONDS = 7200
+POLL_SECONDS = 10
+MAGIC = 20261111
+ENABLE_DEMO_ORDERS = True  # SAFE PREVIEW; no order submission
+STATE_FILE = Path(__file__).with_name("vol80_adx25_preview_state.json")
+KILL_SWITCH = Path(__file__).with_name("VOL80_STOP.txt")
+TIMEFRAMES = {"M1": mt5.TIMEFRAME_M1, "M5": mt5.TIMEFRAME_M5, "M15": mt5.TIMEFRAME_M15}
+
+
+def log(*args):
+    print(datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"), *args, flush=True)
+
+
+def reject(message):
+    raise RuntimeError(message)
+
+
+def save_state(state):
+    temp = STATE_FILE.with_suffix(".tmp")
+    temp.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    temp.replace(STATE_FILE)
+
+
+def load_state():
+    if not STATE_FILE.exists():
+        return {}
+    try:
+        state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        if not isinstance(state, dict):
+            reject("Execution state is not a dictionary")
+        return state
+    except (OSError, ValueError) as exc:
+        reject(f"Execution state unreadable: {exc}")
+
+
+def account_and_symbol():
+    account, terminal = mt5.account_info(), mt5.terminal_info()
+    if account is None or terminal is None:
+        reject("MT5 account or terminal unavailable")
+    if account.trade_mode != mt5.ACCOUNT_TRADE_MODE_DEMO:
+        reject("LIVE ACCOUNT DETECTED - DEMO ONLY")
+    if not (terminal.connected and account.trade_allowed and account.trade_expert
+            and terminal.trade_allowed and not terminal.tradeapi_disabled):
+        reject("MT5 trading permissions or connection invalid")
+    if not mt5.symbol_select(SYMBOL, True):
+        reject("VOL_80 symbol unavailable")
+    info, tick = mt5.symbol_info(SYMBOL), mt5.symbol_info_tick(SYMBOL)
+    if info is None or tick is None or info.trade_mode != mt5.SYMBOL_TRADE_MODE_FULL:
+        reject("Symbol not fully tradeable")
+    if info.point <= 0 or info.volume_step <= 0 or info.volume_min <= 0:
+        reject("Invalid symbol specifications")
+    if tick.bid <= 0 or tick.ask <= tick.bid:
+        reject("Invalid bid/ask")
+    age = time.time() + BROKER_TIMESTAMP_OFFSET_SECONDS - tick.time
+    if age < -60 or age > MAX_TICK_AGE_SECONDS:
+        reject(f"Tick timestamp offset/freshness invalid: age={age:.1f}s; verify broker offset")
+    spread = (tick.ask - tick.bid) / info.point
+    if spread > MAX_SPREAD_POINTS:
+        reject(f"Spread exceeds limit: {spread:.1f} points")
+    return account, info, tick
+
+
+def current_day_state(account, state):
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if not state:
+        state = {"date": today, "baseline": float(account.equity),
+                 "last_bar": None, "pending": None, "account_login": int(account.login)}
+        save_state(state)
+        log("First observed daily equity baseline:", state["baseline"])
+    if int(state.get("account_login", -1)) != int(account.login):
+        reject("Account changed; refusing to reuse execution state")
+    if state.get("pending") is not None:
+        reject("Unresolved order intent found in state; inspect MT5 and reconcile manually")
+    if state.get("date") != today:
+        # Baseline is the first observed equity of the new UTC day, not necessarily midnight.
+        state.update(date=today, baseline=float(account.equity), last_bar=None)
+        save_state(state)
+        log("New UTC day baseline observed:", state["baseline"])
+    if not math.isfinite(float(state.get("baseline", 0))) or float(state["baseline"]) <= 0:
+        reject("Invalid daily equity baseline")
+    return state
+
+
+def exposure_and_limits(account, state):
+    now = datetime.now(timezone.utc)
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    deals = mt5.history_deals_get(midnight, now)
+    positions, orders = mt5.positions_get(symbol=SYMBOL), mt5.orders_get(symbol=SYMBOL)
+    if deals is None or positions is None or orders is None:
+        reject("Cannot inspect account deals, positions or pending orders")
+    entries = sum(d.symbol == SYMBOL and d.entry in
+                  (mt5.DEAL_ENTRY_IN, mt5.DEAL_ENTRY_INOUT) for d in deals)
+    if entries >= MAX_DAILY_ENTRIES:
+        reject(f"Daily VOL_80 entry limit reached: {entries}")
+    if len(positions) >= MAX_OPEN_POSITIONS:
+        reject(f"VOL_80 open position cap reached: {len(positions)}")
+    if orders:
+        reject("Pending VOL_80 orders exist")
+    baseline = float(state["baseline"])
+    drawdown_dollars = max(0.0, baseline - float(account.equity))
+    daily_budget = baseline * DAILY_EQUITY_LOSS_LIMIT
+    if drawdown_dollars >= daily_budget:
+        reject("Daily equity drawdown limit reached")
+    # Count potential losses to all existing VOL_80 stops, from current mark.
+    open_risk = existing_risk(positions, account)
+    remaining = daily_budget - drawdown_dollars - open_risk
+    if remaining <= 0:
+        reject("Daily loss budget exhausted after open-position exposure")
+    return entries, positions, remaining, open_risk
+
+
+def latest_closed_m1():
+    bars = mt5.copy_rates_from_pos(SYMBOL, mt5.TIMEFRAME_M1, 1, 1)
+    if bars is None or len(bars) != 1:
+        reject("Cannot read latest completed M1 bar")
+    return int(bars[0]["time"])
+
+def indicators(timeframe):
+    # Start at position 1: exclude currently forming candle.
+    rates = mt5.copy_rates_from_pos(SYMBOL, timeframe, 1, 220)
+    if rates is None or len(rates) < 200:
+        reject("Insufficient historical candles")
+    df = pd.DataFrame(rates)
+    close = df["close"].astype(float)
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    ema20 = close.ewm(span=20, adjust=False).mean()
+    ema50 = close.ewm(span=50, adjust=False).mean()
+    delta = close.diff()
+    gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
+    rs = gain / loss.replace(0, float("nan"))
+    rsi = 100 - 100 / (1 + rs)
+    macd = close.ewm(span=12, adjust=False).mean() - close.ewm(span=26, adjust=False).mean()
+    signal = macd.ewm(span=9, adjust=False).mean()
+    prev_close = close.shift(1)
+    tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1 / 14, adjust=False).mean()
+    vals = {"close": close.iloc[-1], "ema20": ema20.iloc[-1], "ema50": ema50.iloc[-1], "rsi14": rsi.iloc[-1], "macd": macd.iloc[-1], "macd_signal": signal.iloc[-1], "atr14": atr.iloc[-1]}
+    if not all(math.isfinite(float(v)) for v in vals.values()):
+        reject("Indicator calculation invalid")
+    # Detect whether any of the prior three CLOSED candles touched its EMA20.
+    # The most recent closed candle is reserved for momentum confirmation.
+    recent_touch = any(
+        float(low.iloc[i]) <= float(ema20.iloc[i]) <= float(high.iloc[i])
+        for i in (-4, -3, -2)
+    )
+    return {
+        "closed_bar_time": int(df["time"].iloc[-1]),
+        **{k: round(float(v), 5) for k, v in vals.items()},
+        "previous_close": round(float(close.iloc[-2]), 5),
+        "previous_rsi14": round(float(rsi.iloc[-2]), 5),
+        "recent_ema20_touch": bool(recent_touch),
+    }
+
+
+def trend_following_signal(snapshot):
+    """M15 primary trend, M5 confirmation, M1 completed-bar entry.
+
+    Require matching EMA trend across all timeframes. M1 additionally
+    requires a directional close, RSI and MACD confirmation.
+    """
+    m15, m5, m1 = snapshot["M15"], snapshot["M5"], snapshot["M1"]
+    bullish = all(
+        bar["ema20"] > bar["ema50"] and bar["close"] > bar["ema20"]
+        for bar in (m15, m5)
+    )
+    bearish = all(
+        bar["ema20"] < bar["ema50"] and bar["close"] < bar["ema20"]
+        for bar in (m15, m5)
+    )
+    buy_confirm = (
+        m1["ema20"] > m1["ema50"]
+        and m1["close"] > m1["ema20"]
+        and m1["close"] > m1["previous_close"]
+        and m1["rsi14"] > 50
+        and m1["macd"] > m1["macd_signal"]
+    )
+    sell_confirm = (
+        m1["ema20"] < m1["ema50"]
+        and m1["close"] < m1["ema20"]
+        and m1["close"] < m1["previous_close"]
+        and m1["rsi14"] < 50
+        and m1["macd"] < m1["macd_signal"]
+    )
+    if bullish and buy_confirm:
+        return "BUY"
+    if bearish and sell_confirm:
+        return "SELL"
+    return "WAIT"
+
+
+def groq_decision(snapshot):
+    key = os.getenv("GROQ_API_KEY")
+    if not key:
+        reject("GROQ_API_KEY not configured")
+    client = Groq(api_key=key, timeout=25.0, max_retries=0)
+    system = (
+        "You are a cautious technical-analysis classifier for a synthetic index. "
+        "Return ONLY a JSON object with keys action, confidence, reason. "
+        "action must be BUY, SELL or WAIT; confidence must be an integer 0..100. "
+        "If timeframes conflict, data is uncertain, or indicators do not clearly agree, choose WAIT. "
+        "Confidence is a subjective signal score, not a probability of profit. "
+        "Evaluate M15 main trend, M5 confirmation and M1 entry on completed candles; choose WAIT if the setup is weak."
+    )
+    response = client.chat.completions.create(
+        model=MODEL,
+        temperature=0,
+        max_completion_tokens=1200,
+        reasoning_effort="low",
+        response_format={"type": "json_object"},
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": json.dumps(snapshot)}],
+    )
+    raw = response.choices[0].message.content or ""
+    try:
+        data = json.loads(raw.strip())
+    except (ValueError, TypeError):
+        reject(f"AI returned invalid JSON: {raw[:150]!r}")
+    if not isinstance(data, dict) or type(data.get("confidence")) is not int or data.get("action") not in ("BUY", "SELL", "WAIT") or not 0 <= data["confidence"] <= 100:
+        reject("AI returned invalid decision fields")
+    if not isinstance(data.get("reason"), str):
+        reject("AI returned invalid reason")
+    return data
+
+
+def last_completed_m1_extremes(expected_bar_time):
+    """Use only the most recently CLOSED M1 candle, never the forming bar."""
+    bars = mt5.copy_rates_from_pos(SYMBOL, mt5.TIMEFRAME_M1, 1, 1)
+    if bars is None or len(bars) != 1:
+        reject("Cannot retrieve previous completed M1 candle for structure SL")
+    bar = bars[0]
+    if int(bar["time"]) != int(expected_bar_time):
+        reject("M1 candle changed during signal preparation; skip this entry")
+    high, low = float(bar["high"]), float(bar["low"])
+    if not (math.isfinite(high) and math.isfinite(low) and high >= low > 0):
+        reject("Invalid completed M1 candle high/low")
+    return high, low
+
+
+def price_and_volume(action, account, info, tick, m1_high=None, m1_low=None):
+    """Fixed entry-relative 500-point SL and 700-point TP; no candle-based stops."""
+    if action not in ("BUY", "SELL"):
+        reject("Not a trade direction")
+    point = float(info.point)
+    if not math.isfinite(point) or point <= 0:
+        reject("Invalid broker point size")
+    digits = int(info.digits)
+    entry = round(float(tick.ask if action == "BUY" else tick.bid), digits)
+    sl = round(entry + (-500 if action == "BUY" else 500) * point, digits)
+    tp = round(entry + (700 if action == "BUY" else -700) * point, digits)
+    if sl <= 0 or tp <= 0:
+        reject("Invalid SL/TP price")
+    if min(abs(entry - sl), abs(entry - tp)) <= (int(info.trade_stops_level) + 1) * point:
+        reject("Broker minimum protective distance not met")
+    order_type = mt5.ORDER_TYPE_BUY if action == "BUY" else mt5.ORDER_TYPE_SELL
+    budget = float(account.equity) * RISK_PER_TRADE
+    min_pnl = mt5.order_calc_profit(order_type, SYMBOL, float(info.volume_min), entry, sl)
+    if min_pnl is None or not math.isfinite(float(min_pnl)) or float(min_pnl) >= 0:
+        reject("Minimum-volume stop-loss estimate invalid")
+    min_loss = abs(float(min_pnl))
+    if min_loss > budget:
+        reject("Minimum lot exceeds risk allowance")
+    steps = math.floor((budget / min_loss) * float(info.volume_min) / float(info.volume_step) + 1e-9)
+    volume = min(float(info.volume_max), round(steps * float(info.volume_step), 8))
+    if volume < float(info.volume_min):
+        reject("Calculated lot below minimum")
+    pnl = mt5.order_calc_profit(order_type, SYMBOL, volume, entry, sl)
+    if pnl is None or not math.isfinite(float(pnl)) or float(pnl) >= 0:
+        reject("Final risk estimate invalid")
+    estimated_loss = abs(float(pnl))
+    if estimated_loss > budget + 1e-6:
+        reject("Trade risk exceeds allowance")
+    return order_type, entry, sl, tp, volume, estimated_loss, budget
+
+
+def existing_risk(positions, account):
+    # Conservative aggregate stop-loss risk; reject positions without a valid SL.
+    total = 0.0
+    for p in positions:
+        if not p.sl or p.sl <= 0:
+            reject("Existing VOL_80 position without SL")
+        kind = mt5.ORDER_TYPE_BUY if p.type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_SELL
+        current = mt5.symbol_info_tick(SYMBOL)
+        if current is None:
+            reject("Cannot price existing positions")
+        exit_price = float(current.bid if p.type == mt5.POSITION_TYPE_BUY else current.ask)
+        # Risk still outstanding from current mark to stop; nonnegative.
+        potential = mt5.order_calc_profit(kind, SYMBOL, float(p.volume), exit_price, float(p.sl))
+        if potential is None or not math.isfinite(float(potential)):
+            reject("Cannot calculate existing position risk")
+        total += max(0.0, -float(potential))
+    return total
+
+
+def make_request(order_type, volume, entry, sl, tp, info):
+    # FOK first if supported; filling_mode is a bitmask on many brokers.
+    filling = mt5.ORDER_FILLING_IOC if (int(info.filling_mode) & 2) else mt5.ORDER_FILLING_FOK
+    return {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": SYMBOL,
+        "volume": volume,
+        "type": order_type,
+        "price": entry,
+        "sl": sl,
+        "tp": tp,
+        "deviation": 20,
+        "magic": MAGIC,
+        "comment": "VOL80_GROQ_DEMO",
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": filling,
+    }
+
+
+
+
+def cycle():
+    if KILL_SWITCH.exists():
+        reject("Emergency stop file VOL80_STOP.txt exists")
+    account, info, tick = account_and_symbol()
+    state = current_day_state(account, load_state())
+    bar_id = latest_closed_m1()
+    if state.get("last_bar") == bar_id:
+        return
+    if state.get("last_bar") is not None and bar_id < int(state["last_bar"]):
+        reject("M1 bar time moved backward")
+    # Consume bar before any network calls; no repeat after failures/restarts.
+    state["last_bar"] = bar_id
+    save_state(state)
+    entries, positions, remaining, open_risk = exposure_and_limits(account, state)
+    snapshot = {name: indicators(tf) for name, tf in TIMEFRAMES.items()}
+    if snapshot["M1"]["closed_bar_time"] != bar_id:
+        reject("M1 candle changed during indicator calculation")
+    candidate = trend_following_signal(snapshot)
+    log("Trend candidate:", candidate, "entries today:", entries,
+        "open positions:", len(positions), "remaining risk budget:", round(remaining, 2))
+    if candidate == "WAIT":
+        return
+    decision = groq_decision(snapshot)
+    log("Groq:", decision)
+    if decision["action"] != candidate or decision["confidence"] < MIN_CONFIDENCE:
+        log("SKIP: Groq disagrees or confidence below 60")
+        return
+    # Recheck account and every limit immediately before preparing order.
+    account, info, tick = account_and_symbol()
+    state = current_day_state(account, load_state())
+    entries, positions, remaining, open_risk = exposure_and_limits(account, state)
+    m1_high, m1_low = last_completed_m1_extremes(bar_id)
+    order_type, entry, sl, tp, volume, loss, budget = price_and_volume(
+        candidate, account, info, tick, m1_high, m1_low)
+    # Cap initial execution to 0.01 lot, and recompute actual stop risk.
+    if float(info.volume_min) > MAX_LOTS:
+        reject("Broker minimum lot exceeds demo test cap")
+    volume = min(volume, MAX_LOTS)
+    volume = round(math.floor(volume / float(info.volume_step) + 1e-9)
+                   * float(info.volume_step), 8)
+    if volume < float(info.volume_min):
+        reject("Lot below broker minimum after cap")
+    pnl = mt5.order_calc_profit(order_type, SYMBOL, volume, entry, sl)
+    if pnl is None or not math.isfinite(float(pnl)) or pnl >= 0:
+        reject("Invalid capped position stop-loss estimate")
+    loss = -float(pnl)
+    if loss > min(remaining, float(account.equity) * RISK_PER_TRADE) + 1e-6:
+        reject("Order risk exceeds daily or per-trade risk allowance")
+    if KILL_SWITCH.exists():
+        reject("Emergency stop engaged")
+    margin = mt5.order_calc_margin(order_type, SYMBOL, volume, entry)
+    if margin is None or not math.isfinite(float(margin)) or margin > account.margin_free:
+        reject("Insufficient margin")
+    request = make_request(order_type, volume, entry, sl, tp, info)
+    log("M1 STRUCTURE:", "completed candle high", m1_high, "low", m1_low,
+        "SL points", STOP_LOSS_POINTS, "TP points", TAKE_PROFIT_POINTS)
+    log("PROPOSED:", candidate, "lots", volume, "entry", entry,
+        "SL", sl, "TP", tp, "stop risk USD", round(loss, 2))
+    log("SAFE PREVIEW: no order_send called")
+    return
+    # Prevent duplicate/uncertain sends: persist intent BEFORE sending.
+    # On any ambiguous result, do not retry automatically.
+    account, refreshed_info, refreshed_tick = account_and_symbol()
+    if KILL_SWITCH.exists():
+        reject("Emergency stop engaged before send")
+    # Requote rather than submit a stale order, and ensure SL/TP risk still valid.
+    new_entry = float(refreshed_tick.ask if candidate == "BUY" else refreshed_tick.bid)
+    if abs(new_entry - entry) > 20 * float(refreshed_info.point):
+        reject("Price moved beyond allowed deviation; skip candle")
+    entries, positions, remaining, open_risk = exposure_and_limits(account, state)
+    if loss > remaining + 1e-6:
+        reject("Remaining risk budget changed before order")
+    check = mt5.order_check(request)
+    if check is None or check.retcode != 0:
+        reject(f"Broker order_check rejected: {getattr(check, 'retcode', mt5.last_error())}")
+    state["pending"] = {"bar": bar_id, "side": candidate, "request": request,
+                        "created_utc": datetime.now(timezone.utc).isoformat()}
+    save_state(state)
+    result = mt5.order_send(request)
+    if result is None:
+        reject(f"order_send uncertain (no response): {mt5.last_error()}; reconcile manually")
+    log("MT5 order_send result:", "retcode", result.retcode,
+        "order", result.order, "deal", result.deal, "volume", result.volume)
+    if result.retcode != mt5.TRADE_RETCODE_DONE:
+        reject("Order not confirmed as fully filled; inspect MT5; no automatic retry")
+    # Verify the broker-side protective orders before clearing the pending guard.
+    # Some netting accounts merge positions; if not unambiguously verifiable, halt.
+    open_positions = mt5.positions_get(symbol=SYMBOL)
+    if open_positions is None:
+        reject("Fill confirmed but positions unavailable; inspect MT5 manually")
+    matching = [p for p in open_positions if int(p.magic) == MAGIC
+                and p.sl > 0 and p.tp > 0
+                and abs(float(p.sl) - sl) <= float(info.point)
+                and abs(float(p.tp) - tp) <= float(info.point)]
+    if not matching:
+        reject("Fill confirmed but broker-side SL/TP not verified; inspect MT5 immediately")
+    # Persist successful send. If save fails, pending intent remains as a stop-on-restart guard.
+    state["pending"] = None
+    state["last_order"] = {"bar": bar_id, "order": int(result.order),
+                           "deal": int(result.deal), "side": candidate}
+    save_state(state)
+    log("DEMO ORDER FILLED: verify SL/TP on MT5 Trade tab")
+
+
+def main():
+    log("VOL_80 DEMO AUTO BOT starting; ENABLE_DEMO_ORDERS=", ENABLE_DEMO_ORDERS)
+    if not mt5.initialize():
+        reject(f"MT5 initialization failed: {mt5.last_error()}")
+    try:
+        account, info, tick = account_and_symbol()
+        log("DEMO account verified; login", account.login, "broker tick age checked")
+        while True:
+            try:
+                cycle()
+            except KeyboardInterrupt:
+                raise
+            except Exception as exc:
+                log("SAFE SKIP:", type(exc).__name__, str(exc))
+                # An unresolved order intent requires manual review, not repeated attempts.
+                if load_state().get("pending") is not None:
+                    log("HALTED: unresolved order intent; check MT5 before restarting")
+                    break
+            time.sleep(POLL_SECONDS)
+    except KeyboardInterrupt:
+        log("Stopped by Ctrl+C")
+    finally:
+        mt5.shutdown()
+
+
+if __name__ == "__main__":
+    main()
